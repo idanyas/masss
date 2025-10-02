@@ -172,18 +172,12 @@ func main() {
 	scrapeElapsed := time.Since(scrapeStart)
 	fmt.Printf("\n✓ Scraped %d unique proxies in %.2fs\n", len(proxies), scrapeElapsed.Seconds())
 
-	// Sort proxies for consistent, organized output
-	fmt.Print("Sorting proxies... ")
-	sortStart := time.Now()
-	domain.SortProxies(proxies)
-	fmt.Printf("done in %.3fs\n", time.Since(sortStart).Seconds())
-
-	// Save all proxies
+	// Save all proxies (no sorting - saves time)
 	if err := fileStorage.Save(proxies, cfg.OutputFile); err != nil {
 		fmt.Printf("✗ Error saving to file: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("✓ Saved all proxies to %s (sorted by IP:port)\n\n", cfg.OutputFile)
+	fmt.Printf("✓ Saved all proxies to %s\n\n", cfg.OutputFile)
 
 	// === CHECKING PHASE ===
 	fmt.Println("═══ PHASE 2: VALIDATION ═══")
@@ -206,9 +200,6 @@ func main() {
 	}
 
 	checkElapsed := time.Since(checkStart)
-
-	// Sort working proxies by protocol (for consistent output in result files)
-	domain.SortProxiesByProtocol(workingProxiesByProtocol)
 
 	// Count total working
 	totalWorking := 0

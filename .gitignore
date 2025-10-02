@@ -31,7 +31,9 @@ go.work.sum
 # .idea/
 # .vscode/
 
-result/
+# Scraped proxies (before validation) - don't commit
 all.txt
+
+# Output files - don't commit
 output.md
 output_*.md

@@ -169,21 +169,21 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 
 	elapsed := time.Since(start)
 
-	// Sort and write all output files
-	fmt.Print("\nSorting and writing results... ")
-	sortStart := time.Now()
+	// Write all output files (no sorting)
+	fmt.Print("\nWriting results... ")
+	writeStart := time.Now()
 
-	// Sort and write protocol-specific text files (sorted by proxy IP:port)
-	if err := c.writeSortedResults(savedProxies, outputDir); err != nil {
-		return nil, fmt.Errorf("failed to write sorted results: %w", err)
+	// Write protocol-specific text files
+	if err := c.writeResults(savedProxies, outputDir); err != nil {
+		return nil, fmt.Errorf("failed to write results: %w", err)
 	}
 
-	// Sort and write JSON file (sorted by public IP)
-	if err := c.writeSortedJSON(jsonResults); err != nil {
-		fmt.Printf("\nWarning: Failed to write sorted JSON: %v\n", err)
+	// Write JSON file
+	if err := c.writeJSON(jsonResults); err != nil {
+		fmt.Printf("\nWarning: Failed to write JSON: %v\n", err)
 	}
 
-	fmt.Printf("done in %.3fs\n", time.Since(sortStart).Seconds())
+	fmt.Printf("done in %.3fs\n", time.Since(writeStart).Seconds())
 
 	// Count total working
 	totalWorking := 0
@@ -206,27 +206,24 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 	for _, proto := range c.protocols {
 		count := len(savedProxies[proto])
 		if count > 0 {
-			fmt.Printf("  ✓ %s: %d proxies → %s/%s.txt (sorted by IP:port)\n",
+			fmt.Printf("  ✓ %s: %d proxies → %s/%s.txt\n",
 				strings.ToUpper(string(proto)), count, outputDir, proto)
 		}
 	}
-	fmt.Printf("\n✓ JSON results saved to %s (sorted by public IP)\n", c.cfg.ResultJSONFile)
+	fmt.Printf("\n✓ JSON results saved to %s\n", c.cfg.ResultJSONFile)
 	fmt.Println()
 
 	return savedProxies, nil
 }
 
-// writeSortedResults sorts and writes final protocol-specific files
-func (c *ProxyChecker) writeSortedResults(savedProxies map[domain.Protocol][]domain.Proxy, outputDir string) error {
+// writeResults writes final protocol-specific files (no sorting for speed)
+func (c *ProxyChecker) writeResults(savedProxies map[domain.Protocol][]domain.Proxy, outputDir string) error {
 	for proto, proxies := range savedProxies {
 		if len(proxies) == 0 {
 			continue
 		}
 
-		// Sort proxies by IP:port
-		domain.SortProxies(proxies)
-
-		// Write sorted file
+		// Write file directly without sorting
 		filename := filepath.Join(outputDir, string(proto)+".txt")
 		file, err := os.Create(filename)
 		if err != nil {
@@ -244,16 +241,13 @@ func (c *ProxyChecker) writeSortedResults(savedProxies map[domain.Protocol][]dom
 	return nil
 }
 
-// writeSortedJSON sorts results by public IP and writes JSON file
-func (c *ProxyChecker) writeSortedJSON(results []domain.ProxyResult) error {
+// writeJSON writes JSON results (no sorting for speed)
+func (c *ProxyChecker) writeJSON(results []domain.ProxyResult) error {
 	if len(results) == 0 {
 		return nil
 	}
 
-	// Sort by public IP (numerically)
-	domain.SortProxyResultsByIP(results)
-
-	// Write formatted JSON
+	// Write formatted JSON without sorting
 	data, err := json.MarshalIndent(results, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal JSON: %w", err)
@@ -489,7 +483,7 @@ func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count
 				if rate > 0 {
 					eta = float64(remaining) / rate
 				}
-
+				
 				percentage := float64(chk) / float64(total) * 100
 
 				// Progress bar (20 chars wide)

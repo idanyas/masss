@@ -1,0 +1,69 @@
+name: Update Proxy Lists
+
+on:
+  schedule:
+    # Run every 10 minutes
+    - cron: "*/10 * * * *"
+  workflow_dispatch: # Allow manual triggering
+
+permissions:
+  contents: write
+
+jobs:
+  update-proxies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # Prevent hanging workflows
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run proxy scraper and checker
+        id: scraper
+        run: |
+          echo "Starting proxy scraper..."
+          go run main.go
+        continue-on-error: true # Don't fail workflow if no proxies found
+
+      - name: Check for changes
+        id: check_changes
+        run: |
+          if git diff --quiet result/; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No changes detected in result/ directory"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Changes detected in result/ directory"
+          fi
+
+      - name: Commit and push changes
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          git add result/
+          git commit -m "🔄 Update proxy lists - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-logs
+          path: |
+            all.txt
+            result/
+          retention-days: 1
