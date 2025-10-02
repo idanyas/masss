@@ -476,13 +476,12 @@ func (c *ProxyChecker) checkEndpoint(ctx context.Context, client *http.Client, e
 	return returnedIP, true
 }
 
-// progressReporter prints periodic progress updates with protocol breakdown
+// progressReporter prints periodic progress updates with stable ETA calculation
 func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count, socks5Count, retries *atomic.Int32, total int, done <-chan struct{}) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	lastChecked := int32(0)
-	lastTime := time.Now()
+	startTime := time.Now()
 
 	for {
 		select {
@@ -496,17 +495,17 @@ func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count
 			socks5 := socks5Count.Load()
 			retry := retries.Load()
 
-			// Calculate rate
-			elapsed := time.Since(lastTime).Seconds()
-			rate := float64(chk-lastChecked) / elapsed
-			lastChecked = chk
-			lastTime = time.Now()
-
 			if chk > 0 {
+				// Calculate overall average rate from start (stable and accurate)
+				overallElapsed := time.Since(startTime).Seconds()
+				overallRate := float64(chk) / overallElapsed
+
 				remaining := total - int(chk)
+
+				// Use overall rate for stable ETA
 				eta := 0.0
-				if rate > 0 {
-					eta = float64(remaining) / rate
+				if overallRate > 0 {
+					eta = float64(remaining) / overallRate
 				}
 
 				percentage := float64(chk) / float64(total) * 100
@@ -516,9 +515,9 @@ func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count
 				filled := int(percentage / 100 * float64(barWidth))
 				bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
 
-				// Line 1: Overall progress
-				fmt.Printf("\r\033[KChecked: %d/%d (%.1f%%) [%s] %.0f/s | ETA: %.0fs\n",
-					chk, total, percentage, bar, rate, eta)
+				// Line 1: Overall progress with human-readable ETA
+				fmt.Printf("\r\033[KChecked: %d/%d (%.1f%%) [%s] %.0f/s | ETA: %s\n",
+					chk, total, percentage, bar, overallRate, formatDuration(eta))
 
 				// Line 2: Protocol breakdown
 				successRate := float64(0)
@@ -530,4 +529,22 @@ func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count
 			}
 		}
 	}
+}
+
+// formatDuration converts seconds to human-readable format (e.g., "5m 30s")
+func formatDuration(seconds float64) string {
+	if seconds < 0 {
+		return "0s"
+	}
+	if seconds < 60 {
+		return fmt.Sprintf("%.0fs", seconds)
+	}
+	if seconds < 3600 {
+		mins := int(seconds / 60)
+		secs := int(seconds) % 60
+		return fmt.Sprintf("%dm %ds", mins, secs)
+	}
+	hours := int(seconds / 3600)
+	mins := int(seconds/60) % 60
+	return fmt.Sprintf("%dh %dm", hours, mins)
 }

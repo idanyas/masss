@@ -23,7 +23,7 @@ func Default() *Config {
 		OutputFile:     "all.txt",
 		OutputDir:      "result",
 		ResultJSONFile: "result/all.json",
-		CheckerWorkers: 8000,
+		CheckerWorkers: 16000,           // Should be enough for 16 GB ram saturation, I think
 		CheckTimeout:   8 * time.Second, // Reduced from 10s for faster failure detection
 		CheckEndpoints: []string{
 			"https://checkip.amazonaws.com/",
