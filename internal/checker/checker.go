@@ -260,25 +260,44 @@ func (c *ProxyChecker) writeJSON(results []domain.ProxyResult) error {
 	return nil
 }
 
-// collectResults collects working proxies in memory only (no file writes during validation)
-func (c *ProxyChecker) collectResults(workingProxies <-chan WorkingProxy, httpCount, socks4Count, socks5Count *atomic.Int32) (map[domain.Protocol][]domain.Proxy, []domain.ProxyResult) {
-	proxies := make(map[domain.Protocol][]domain.Proxy)
-	proxies[domain.ProtocolHTTP] = make([]domain.Proxy, 0, 100)
-	proxies[domain.ProtocolSOCKS4] = make([]domain.Proxy, 0, 100)
-	proxies[domain.ProtocolSOCKS5] = make([]domain.Proxy, 0, 100)
+// groupKey is used to group proxies by public IP and protocol for JSON output
+type groupKey struct {
+	ip    string
+	proto domain.Protocol
+}
 
-	jsonResults := make([]domain.ProxyResult, 0, 100)
+// collectResults collects working proxies, grouping them for JSON output.
+func (c *ProxyChecker) collectResults(workingProxies <-chan WorkingProxy, httpCount, socks4Count, socks5Count *atomic.Int32) (map[domain.Protocol][]domain.Proxy, []domain.ProxyResult) {
+	// For protocol-specific .txt files
+	proxiesByProto := make(map[domain.Protocol][]domain.Proxy)
+	proxiesByProto[domain.ProtocolHTTP] = make([]domain.Proxy, 0, 100)
+	proxiesByProto[domain.ProtocolSOCKS4] = make([]domain.Proxy, 0, 100)
+	proxiesByProto[domain.ProtocolSOCKS5] = make([]domain.Proxy, 0, 100)
+
+	// For grouped JSON results
+	groupedResults := make(map[groupKey]*domain.ProxyResult)
+	orderedResults := make([]*domain.ProxyResult, 0, 100)
 
 	for wp := range workingProxies {
-		// Store in memory by protocol
-		proxies[wp.Protocol] = append(proxies[wp.Protocol], wp.Proxy)
+		// Store in memory by protocol for .txt files
+		proxiesByProto[wp.Protocol] = append(proxiesByProto[wp.Protocol], wp.Proxy)
 
-		// Collect JSON results
-		jsonResults = append(jsonResults, domain.ProxyResult{
-			Protocol: string(wp.Protocol),
-			Address:  string(wp.Proxy),
-			PublicIP: wp.PublicIP,
-		})
+		// Group for JSON output
+		key := groupKey{ip: wp.PublicIP, proto: wp.Protocol}
+		if existing, found := groupedResults[key]; found {
+			// Add as an alias to the existing entry
+			existing.Aliases = append(existing.Aliases, domain.Alias{Address: string(wp.Proxy)})
+		} else {
+			// Create a new entry
+			newResult := &domain.ProxyResult{
+				Protocol: string(wp.Protocol),
+				Address:  string(wp.Proxy),
+				PublicIP: wp.PublicIP,
+				// Aliases will be nil, omitted by omitempty
+			}
+			groupedResults[key] = newResult
+			orderedResults = append(orderedResults, newResult)
+		}
 
 		// Increment the appropriate protocol counter
 		switch wp.Protocol {
@@ -291,7 +310,13 @@ func (c *ProxyChecker) collectResults(workingProxies <-chan WorkingProxy, httpCo
 		}
 	}
 
-	return proxies, jsonResults
+	// Convert slice of pointers to slice of values for the return type
+	finalJSONResults := make([]domain.ProxyResult, len(orderedResults))
+	for i, res := range orderedResults {
+		finalJSONResults[i] = *res
+	}
+
+	return proxiesByProto, finalJSONResults
 }
 
 // worker processes proxies from the job channel with retry logic
@@ -483,7 +508,7 @@ func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count
 				if rate > 0 {
 					eta = float64(remaining) / rate
 				}
-				
+
 				percentage := float64(chk) / float64(total) * 100
 
 				// Progress bar (20 chars wide)

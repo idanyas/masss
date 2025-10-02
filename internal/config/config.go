@@ -29,7 +29,7 @@ func Default() *Config {
 			"https://checkip.amazonaws.com/",
 			"https://whatismyip.akamai.com/",
 		},
-		RetryCount: 3,                    // Retry up to 3 times
+		RetryCount: 3,                     // Retry up to 3 times
 		RetryDelay: 50 * time.Millisecond, // Start with 50ms, exponential backoff
 	}
 }

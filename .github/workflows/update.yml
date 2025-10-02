@@ -38,23 +38,132 @@ jobs:
           go run main.go
         continue-on-error: true # Don't fail workflow if no proxies found
 
-      - name: Check for changes
-        id: check_changes
+      - name: Publish results to results branch
+        if: steps.scraper.outcome == 'success'
         run: |
-          if git diff --quiet result/; then
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "No changes detected in result/ directory"
-          else
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "Changes detected in result/ directory"
+          # Check if results were generated
+          if [ ! -d "result" ] || [ ! -f "all.txt" ]; then
+            echo "⚠️  No results to publish"
+            exit 0
           fi
 
-      - name: Commit and push changes
-        if: steps.check_changes.outputs.changed == 'true'
-        run: |
-          git add result/
-          git commit -m "🔄 Update proxy lists - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          git push
+          echo "📦 Preparing results for publishing..."
+
+          # Save results to temp location (preserve across branch switch)
+          mkdir -p /tmp/proxy-results
+          cp -r result /tmp/proxy-results/
+          cp all.txt /tmp/proxy-results/
+
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Fetch all branches
+          git fetch origin
+
+          # Switch to results branch (create orphan if doesn't exist)
+          if git rev-parse --verify origin/results >/dev/null 2>&1; then
+            echo "📍 Switching to existing results branch..."
+            git checkout -f results
+          else
+            echo "📍 Creating new orphan results branch..."
+            git checkout --orphan results
+          fi
+
+          # Clean the branch completely (keep only .git)
+          echo "🧹 Cleaning branch..."
+          git rm -rf . 2>/dev/null || true
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} + 2>/dev/null || true
+
+          # Copy results back
+          echo "📋 Copying results..."
+          cp -r /tmp/proxy-results/result .
+          cp /tmp/proxy-results/all.txt .
+
+          # Create README for results branch
+          cat > README.md << 'HEREDOC'
+          # 🌐 Proxy Results
+
+          This branch contains automatically generated and validated proxy lists.
+
+          ## 📁 Files
+
+          - **`all.txt`** - All unique scraped proxies (before validation)
+          - **`result/http.txt`** - Validated HTTP proxies
+          - **`result/socks4.txt`** - Validated SOCKS4 proxies
+          - **`result/socks5.txt`** - Validated SOCKS5 proxies
+          - **`result/all.json`** - All validated proxies with metadata and aliases
+
+          ## 🔄 Update Frequency
+
+          Automatically updated every 10 minutes via GitHub Actions.
+
+          ## 📥 Quick Download
+
+          ### Using curl
+
+          ```bash
+          # HTTP proxies
+          curl -sL https://raw.githubusercontent.com/REPOSITORY_NAME/results/result/http.txt
+
+          # SOCKS5 proxies
+          curl -sL https://raw.githubusercontent.com/REPOSITORY_NAME/results/result/socks5.txt
+
+          # SOCKS4 proxies
+          curl -sL https://raw.githubusercontent.com/REPOSITORY_NAME/results/result/socks4.txt
+
+          # All scraped proxies (unvalidated)
+          curl -sL https://raw.githubusercontent.com/REPOSITORY_NAME/results/all.txt
+
+          # JSON with full metadata
+          curl -sL https://raw.githubusercontent.com/REPOSITORY_NAME/results/result/all.json
+          ```
+
+          ### Using wget
+
+          ```bash
+          wget https://raw.githubusercontent.com/REPOSITORY_NAME/results/result/http.txt
+          ```
+
+          ## ⚙️ Source Code
+
+          The scraper source code and documentation are available on the [main branch](../../tree/main).
+
+          ## 📊 JSON Format
+
+          The `all.json` file groups proxies by public IP and protocol, with aliases for duplicates:
+
+          ```json
+          [
+            {
+              "protocol": "http",
+              "address": "1.2.3.4:8080",
+              "public_ip": "1.2.3.4",
+              "aliases": [
+                {"address": "1.2.3.4:8081"}
+              ]
+            }
+          ]
+          ```
+
+          ---
+
+          *This branch contains only the latest results. History is not preserved to keep the repository lightweight.*
+          HEREDOC
+
+          # Replace repository placeholder
+          sed -i "s|REPOSITORY_NAME|${{ github.repository }}|g" README.md
+
+          # Commit and push
+          git add .
+
+          if git diff --staged --quiet; then
+            echo "ℹ️  No changes to commit"
+          else
+            git commit -m "🔄 Update proxy lists - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            git push --force origin results
+            echo "✅ Results published to results branch"
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

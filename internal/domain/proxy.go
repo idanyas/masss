@@ -25,11 +25,18 @@ type ProxySource struct {
 	ParserType string // "default", "json", etc. - extensible
 }
 
-// ProxyResult represents a validated proxy with its metadata for JSON output
+// Alias represents an alternative address for a proxy with the same public IP and protocol
+type Alias struct {
+	Address string `json:"address"`
+}
+
+// ProxyResult represents a validated proxy with its metadata for JSON output.
+// It groups proxies with the same public IP and protocol using Aliases.
 type ProxyResult struct {
-	Protocol string `json:"protocol"`
-	Address  string `json:"address"`
-	PublicIP string `json:"public_ip"`
+	Protocol string  `json:"protocol"`
+	Address  string  `json:"address"`
+	PublicIP string  `json:"public_ip"`
+	Aliases  []Alias `json:"aliases,omitempty"`
 }
 
 // ProxyInfo contains parsed proxy components
