@@ -9,12 +9,13 @@ import (
 )
 
 // DefaultParser parses standard IP:PORT format and handles protocol prefixes
+// Only accepts IPv4 addresses, filters out IPv6 during parsing
 // Supported formats:
-//   - ip:port
-//   - user:pass@ip:port
-//   - ip:port:user:pass
-//   - protocol://ip:port (strips protocol)
-//   - protocol://user:pass@ip:port (strips protocol)
+//   - ip:port (IPv4 only)
+//   - user:pass@ip:port (IPv4 only)
+//   - ip:port:user:pass (IPv4 only)
+//   - protocol://ip:port (strips protocol, IPv4 only)
+//   - protocol://user:pass@ip:port (strips protocol, IPv4 only)
 type DefaultParser struct{}
 
 // NewDefaultParser creates a new default parser
@@ -23,8 +24,9 @@ func NewDefaultParser() *DefaultParser {
 }
 
 // Parse parses proxy data in various formats and normalizes to user:pass@ip:port or ip:port
+// Filters out IPv6 addresses early to avoid wasting resources
 func (p *DefaultParser) Parse(data []byte) ([]domain.Proxy, error) {
-	var proxies []domain.Proxy
+	proxies := make([]domain.Proxy, 0, bytes.Count(data, []byte("\n")))
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 
 	for scanner.Scan() {
@@ -35,10 +37,10 @@ func (p *DefaultParser) Parse(data []byte) ([]domain.Proxy, error) {
 			continue
 		}
 
-		// Parse and normalize the proxy
+		// Parse and normalize the proxy (ParseProxyInfo filters IPv6)
 		proxyInfo, err := domain.ParseProxyInfo(line)
 		if err != nil {
-			// Skip invalid entries silently
+			// Skip invalid entries silently (includes IPv6)
 			continue
 		}
 

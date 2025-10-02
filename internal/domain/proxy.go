@@ -34,13 +34,24 @@ type ProxyResult struct {
 
 // ProxyInfo contains parsed proxy components
 type ProxyInfo struct {
-	Host     string // IP or hostname
+	Host     string // IP or hostname (IPv4 only)
 	Port     string // Port number
 	Username string // Optional username (empty if no auth)
 	Password string // Optional password (empty if no auth)
 }
 
+// IsIPv4 checks if the given IP address is a valid IPv4 address
+func IsIPv4(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	// Check if it's a valid IPv4 (To4 returns nil for IPv6)
+	return ip.To4() != nil
+}
+
 // ParseProxyInfo parses a proxy string into its components.
+// Only accepts IPv4 addresses, rejects IPv6.
 // Supports formats:
 //   - ip:port
 //   - user:pass@ip:port
@@ -80,6 +91,12 @@ func ParseProxyInfo(proxy string) (ProxyInfo, error) {
 		if err != nil {
 			return ProxyInfo{}, fmt.Errorf("invalid host:port in %s: %w", original, err)
 		}
+
+		// Reject IPv6 addresses
+		if !IsIPv4(host) {
+			return ProxyInfo{}, fmt.Errorf("only IPv4 addresses supported, got: %s", host)
+		}
+
 		info.Host = host
 		info.Port = port
 
@@ -90,7 +107,14 @@ func ParseProxyInfo(proxy string) (ProxyInfo, error) {
 	parts := strings.Split(proxy, ":")
 	if len(parts) == 4 {
 		// Assume ip:port:user:pass
-		info.Host = parts[0]
+		host := parts[0]
+
+		// Reject IPv6 addresses
+		if !IsIPv4(host) {
+			return ProxyInfo{}, fmt.Errorf("only IPv4 addresses supported, got: %s", host)
+		}
+
+		info.Host = host
 		info.Port = parts[1]
 		info.Username = parts[2]
 		info.Password = parts[3]
@@ -103,6 +127,12 @@ func ParseProxyInfo(proxy string) (ProxyInfo, error) {
 		if err != nil {
 			return ProxyInfo{}, fmt.Errorf("invalid host:port format in %s: %w", original, err)
 		}
+
+		// Reject IPv6 addresses
+		if !IsIPv4(host) {
+			return ProxyInfo{}, fmt.Errorf("only IPv4 addresses supported, got: %s", host)
+		}
+
 		info.Host = host
 		info.Port = port
 		return info, nil

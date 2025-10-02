@@ -54,14 +54,22 @@ func createHTTPProxyClient(proxyAddr string, timeout time.Duration) (*http.Clien
 		Proxy: http.ProxyURL(proxyURL),
 		DialContext: (&net.Dialer{
 			Timeout:   timeout,
-			KeepAlive: 0,
+			KeepAlive: 0, // Disable keep-alive for immediate cleanup
+			Resolver: &net.Resolver{
+				PreferGo: true,
+				Dial:     nil,
+			},
 		}).DialContext,
-		MaxIdleConns:        1,
-		MaxIdleConnsPerHost: 1,
-		IdleConnTimeout:     timeout,
+		MaxIdleConns:          1,
+		MaxIdleConnsPerHost:   1,
+		MaxConnsPerHost:       1,
+		IdleConnTimeout:       timeout,
+		DisableKeepAlives:     true, // Force connection close after each request
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 
-	// Add Proxy-Authorization header if needed (some proxies require both)
 	client := &http.Client{
 		Timeout:   timeout,
 		Transport: transport,
@@ -89,6 +97,9 @@ func createSOCKS5Client(proxyAddr string, timeout time.Duration) (*http.Client, 
 	dialer, err := proxy.SOCKS5("tcp", net.JoinHostPort(proxyInfo.Host, proxyInfo.Port), auth, &net.Dialer{
 		Timeout:   timeout,
 		KeepAlive: 0,
+		Resolver: &net.Resolver{
+			PreferGo: true,
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -100,9 +111,14 @@ func createSOCKS5Client(proxyAddr string, timeout time.Duration) (*http.Client, 
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return dialer.Dial(network, addr)
 			},
-			MaxIdleConns:        1,
-			MaxIdleConnsPerHost: 1,
-			IdleConnTimeout:     timeout,
+			MaxIdleConns:          1,
+			MaxIdleConnsPerHost:   1,
+			MaxConnsPerHost:       1,
+			IdleConnTimeout:       timeout,
+			DisableKeepAlives:     true,
+			TLSHandshakeTimeout:   timeout,
+			ResponseHeaderTimeout: timeout,
+			ExpectContinueTimeout: 1 * time.Second,
 		},
 	}, nil
 }
@@ -124,15 +140,20 @@ func createSOCKS4Client(proxyAddr string, timeout time.Duration) (*http.Client, 
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
-			DialContext:         dialer.DialContext,
-			MaxIdleConns:        1,
-			MaxIdleConnsPerHost: 1,
-			IdleConnTimeout:     timeout,
+			DialContext:           dialer.DialContext,
+			MaxIdleConns:          1,
+			MaxIdleConnsPerHost:   1,
+			MaxConnsPerHost:       1,
+			IdleConnTimeout:       timeout,
+			DisableKeepAlives:     true,
+			TLSHandshakeTimeout:   timeout,
+			ResponseHeaderTimeout: timeout,
+			ExpectContinueTimeout: 1 * time.Second,
 		},
 	}, nil
 }
 
-// socks4Dialer implements a simple SOCKS4 dialer with optional username
+// socks4Dialer implements a simple SOCKS4 dialer with optional username (IPv4 only)
 type socks4Dialer struct {
 	proxyAddr string
 	timeout   time.Duration
@@ -143,6 +164,9 @@ func (d *socks4Dialer) DialContext(ctx context.Context, network, addr string) (n
 	dialer := &net.Dialer{
 		Timeout:   d.timeout,
 		KeepAlive: 0,
+		Resolver: &net.Resolver{
+			PreferGo: true,
+		},
 	}
 
 	conn, err := dialer.DialContext(ctx, "tcp", d.proxyAddr)
@@ -159,7 +183,7 @@ func (d *socks4Dialer) DialContext(ctx context.Context, network, addr string) (n
 	port := 0
 	fmt.Sscanf(portStr, "%d", &port)
 
-	// Resolve host to IP
+	// Resolve host to IPv4 only
 	ips, err := net.LookupIP(host)
 	if err != nil {
 		conn.Close()
@@ -178,13 +202,14 @@ func (d *socks4Dialer) DialContext(ctx context.Context, network, addr string) (n
 	}
 
 	// Build SOCKS4 request: VER(1) CMD(1) PORT(2) IP(4) USERID(variable) NULL(1)
-	req := []byte{
+	req := make([]byte, 0, 128)
+	req = append(req,
 		4,                              // SOCKS version
 		1,                              // CONNECT command
-		byte(port >> 8),                // Port high byte
-		byte(port & 0xff),              // Port low byte
+		byte(port>>8),                  // Port high byte
+		byte(port&0xff),                // Port low byte
 		ip4[0], ip4[1], ip4[2], ip4[3], // IP address
-	}
+	)
 
 	// Add username if present
 	if d.username != "" {

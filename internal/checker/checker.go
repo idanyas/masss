@@ -109,17 +109,19 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 	fmt.Printf("Starting proxy validation with %d workers...\n", c.cfg.CheckerWorkers)
 	fmt.Printf("Testing %d proxies against %d protocols and %d endpoints\n",
 		len(proxies), len(c.protocols), len(c.cfg.CheckEndpoints))
+	fmt.Printf("Retry policy: up to %d attempts per proxy\n", c.cfg.RetryCount)
 	fmt.Printf("Writing working proxies to: %s/\n\n", outputDir)
 
 	start := time.Now()
 
 	// Create job and result channels - minimal buffering to reduce memory
-	jobs := make(chan domain.Proxy)
-	workingProxies := make(chan WorkingProxy, 10)
+	jobs := make(chan domain.Proxy, 1)
+	workingProxies := make(chan WorkingProxy, 2)
 
 	// Progress tracking
 	var checked, workingTotal atomic.Int32
 	var httpCount, socks4Count, socks5Count atomic.Int32
+	var retryAttempts atomic.Int32
 
 	// Start result collector (collects in memory, no file writes)
 	collectorDone := make(chan struct{})
@@ -136,13 +138,13 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c.worker(ctx, jobs, workingProxies, &checked, &workingTotal)
+			c.worker(ctx, jobs, workingProxies, &checked, &workingTotal, &retryAttempts)
 		}()
 	}
 
 	// Progress reporter
 	progressDone := make(chan struct{})
-	go c.progressReporter(&checked, &workingTotal, &httpCount, &socks4Count, &socks5Count, len(proxies), progressDone)
+	go c.progressReporter(&checked, &workingTotal, &httpCount, &socks4Count, &socks5Count, &retryAttempts, len(proxies), progressDone)
 
 	// Send jobs
 	go func() {
@@ -196,6 +198,7 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 	fmt.Printf("  Total checked: %d\n", len(proxies))
 	fmt.Printf("  Working: %d (%.1f%%)\n", totalWorking, float64(totalWorking)/float64(len(proxies))*100)
 	fmt.Printf("  Failed: %d\n", len(proxies)-totalWorking)
+	fmt.Printf("  Retry attempts: %d\n", retryAttempts.Load())
 	fmt.Printf("  Speed: %.0f proxies/second\n\n", float64(len(proxies))/elapsed.Seconds())
 
 	// Per-protocol breakdown
@@ -266,11 +269,11 @@ func (c *ProxyChecker) writeSortedJSON(results []domain.ProxyResult) error {
 // collectResults collects working proxies in memory only (no file writes during validation)
 func (c *ProxyChecker) collectResults(workingProxies <-chan WorkingProxy, httpCount, socks4Count, socks5Count *atomic.Int32) (map[domain.Protocol][]domain.Proxy, []domain.ProxyResult) {
 	proxies := make(map[domain.Protocol][]domain.Proxy)
-	proxies[domain.ProtocolHTTP] = make([]domain.Proxy, 0)
-	proxies[domain.ProtocolSOCKS4] = make([]domain.Proxy, 0)
-	proxies[domain.ProtocolSOCKS5] = make([]domain.Proxy, 0)
+	proxies[domain.ProtocolHTTP] = make([]domain.Proxy, 0, 100)
+	proxies[domain.ProtocolSOCKS4] = make([]domain.Proxy, 0, 100)
+	proxies[domain.ProtocolSOCKS5] = make([]domain.Proxy, 0, 100)
 
-	jsonResults := make([]domain.ProxyResult, 0)
+	jsonResults := make([]domain.ProxyResult, 0, 100)
 
 	for wp := range workingProxies {
 		// Store in memory by protocol
@@ -297,8 +300,8 @@ func (c *ProxyChecker) collectResults(workingProxies <-chan WorkingProxy, httpCo
 	return proxies, jsonResults
 }
 
-// worker processes proxies from the job channel
-func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, workingProxies chan<- WorkingProxy, checked, working *atomic.Int32) {
+// worker processes proxies from the job channel with retry logic
+func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, workingProxies chan<- WorkingProxy, checked, working, retries *atomic.Int32) {
 	for proxy := range jobs {
 		select {
 		case <-ctx.Done():
@@ -306,15 +309,28 @@ func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, wor
 		default:
 		}
 
-		// Check this proxy against all protocols
-		if protocol, publicIP, ok := c.isProxyWorking(ctx, proxy); ok {
-			workingProxies <- WorkingProxy{
-				Proxy:    proxy,
-				Protocol: protocol,
-				PublicIP: publicIP,
+		// Try to validate this proxy with retries
+		found := false
+		for attempt := 0; attempt < c.cfg.RetryCount && !found; attempt++ {
+			if attempt > 0 {
+				retries.Add(1)
+				// Exponential backoff: 50ms, 100ms, 200ms
+				delay := c.cfg.RetryDelay * time.Duration(1<<uint(attempt-1))
+				time.Sleep(delay)
 			}
-			working.Add(1)
+
+			// Check this proxy against all protocols
+			if protocol, publicIP, ok := c.isProxyWorking(ctx, proxy); ok {
+				workingProxies <- WorkingProxy{
+					Proxy:    proxy,
+					Protocol: protocol,
+					PublicIP: publicIP,
+				}
+				working.Add(1)
+				found = true
+			}
 		}
+
 		checked.Add(1)
 	}
 }
@@ -428,6 +444,11 @@ func (c *ProxyChecker) checkEndpoint(ctx context.Context, client *http.Client, e
 		return "", false
 	}
 
+	// Validate it's IPv4
+	if !domain.IsIPv4(returnedIP) {
+		return "", false
+	}
+
 	// Reject if same as host IP
 	if _, isHostIP := c.hostIPs[returnedIP]; isHostIP {
 		return "", false
@@ -437,7 +458,7 @@ func (c *ProxyChecker) checkEndpoint(ctx context.Context, client *http.Client, e
 }
 
 // progressReporter prints periodic progress updates with protocol breakdown
-func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count, socks5Count *atomic.Int32, total int, done <-chan struct{}) {
+func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count, socks5Count, retries *atomic.Int32, total int, done <-chan struct{}) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -454,6 +475,7 @@ func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count
 			http := httpCount.Load()
 			socks4 := socks4Count.Load()
 			socks5 := socks5Count.Load()
+			retry := retries.Load()
 
 			// Calculate rate
 			elapsed := time.Since(lastTime).Seconds()
@@ -484,8 +506,8 @@ func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count
 				if chk > 0 {
 					successRate = float64(wrk) / float64(chk) * 100
 				}
-				fmt.Printf("\r\033[KWorking: %d (%.1f%%) | HTTP: %d | SOCKS4: %d | SOCKS5: %d | Failed: %d\033[A",
-					wrk, successRate, http, socks4, socks5, chk-wrk)
+				fmt.Printf("\r\033[KWorking: %d (%.1f%%) | HTTP: %d | SOCKS4: %d | SOCKS5: %d | Retries: %d | Failed: %d\033[A",
+					wrk, successRate, http, socks4, socks5, retry, chk-wrk)
 			}
 		}
 	}
