@@ -89,7 +89,7 @@ jobs:
           - **`result/http.txt`** - Validated HTTP proxies
           - **`result/socks4.txt`** - Validated SOCKS4 proxies
           - **`result/socks5.txt`** - Validated SOCKS5 proxies
-          - **`result/all.json`** - All validated proxies with metadata and aliases
+          - **`result/all.json`** - All validated proxies with metadata (flat list)
 
           ## 🔄 Update Frequency
 
@@ -128,16 +128,16 @@ jobs:
 
           ## 📊 JSON Format
 
-          The `all.json` file groups proxies by public IP and protocol, with aliases for duplicates:
+          The `all.json` file contains all working proxy+protocol combinations as a flat array:
 
           ```json
           [
             {
               "protocol": "http",
               "address": "1.2.3.4:8080",
-              "public_ip": "1.2.3.4",
-              "success_count": 2,
-              "latencies_ms": [125.5, 142.3],
+              "public_ip": "5.6.7.8",
+              "success_count": 5,
+              "latencies_ms": [125.5, 142.3, 138.1, 151.2, 144.7],
               "proxy_geo": {
                 "ip": "1.2.3.4",
                 "city": "New York",
@@ -148,17 +148,19 @@ jobs:
                 "ip": "5.6.7.8",
                 "city": "London",
                 "country": "GB"
-              },
-              "aliases": [
-                {
-                  "address": "1.2.3.4:8081",
-                  "success_count": 1,
-                  "latencies_ms": [156.2]
-                }
-              ]
+              }
+            },
+            {
+              "protocol": "socks5",
+              "address": "1.2.3.4:8080",
+              "public_ip": "5.6.7.8",
+              "success_count": 4,
+              "latencies_ms": [156.2, 149.8, 162.1, 158.4]
             }
           ]
           ```
+
+          **Note:** If a proxy works with multiple protocols, it appears as separate entries for each protocol.
 
           ---
 

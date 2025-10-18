@@ -119,7 +119,7 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 	fmt.Printf("Starting proxy validation with %d workers...\n", c.cfg.CheckerWorkers)
 	fmt.Printf("Testing %d proxies against %d protocols and %d endpoints\n",
 		len(proxies), len(c.protocols), len(c.cfg.CheckEndpoints))
-	fmt.Printf("Validation strategy: %d attempts per proxy for comprehensive statistics\n", c.cfg.RetryCount)
+	fmt.Printf("Validation strategy: %d attempts per proxy+protocol for comprehensive statistics\n", c.cfg.RetryCount)
 	fmt.Printf("Writing working proxies to: %s/\n\n", outputDir)
 
 	start := time.Now()
@@ -214,10 +214,10 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 
 	fmt.Printf("✓ Validation complete in %.2fs\n", elapsed.Seconds())
 	fmt.Printf("  Total checked: %d\n", len(proxies))
-	fmt.Printf("  Working: %d (%.1f%%)\n", totalWorking, float64(totalWorking)/float64(len(proxies))*100)
-	fmt.Printf("  Failed: %d\n", len(proxies)-totalWorking)
-	fmt.Printf("  Total validation attempts: %d\n", additionalAttempts.Load()+int32(len(proxies)))
-	fmt.Printf("  Average attempts per proxy: %.1f\n", float64(additionalAttempts.Load()+int32(len(proxies)))/float64(len(proxies)))
+	fmt.Printf("  Working (unique proxy+protocol combinations): %d\n", totalWorking)
+	fmt.Printf("  Failed: %d\n", len(proxies)-int(checked.Load()))
+	fmt.Printf("  Total validation attempts: %d\n", additionalAttempts.Load()+int32(len(proxies))*int32(len(c.protocols)))
+	fmt.Printf("  Average attempts per proxy: %.1f\n", float64(additionalAttempts.Load()+int32(len(proxies))*int32(len(c.protocols)))/float64(len(proxies)))
 	fmt.Printf("  Speed: %.0f proxies/second\n\n", float64(len(proxies))/elapsed.Seconds())
 
 	// Per-protocol breakdown
@@ -229,7 +229,7 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 				strings.ToUpper(string(proto)), count, outputDir, proto)
 		}
 	}
-	fmt.Printf("\n✓ JSON results saved to %s\n", c.cfg.ResultJSONFile)
+	fmt.Printf("\n✓ JSON results saved to %s (%d entries)\n", c.cfg.ResultJSONFile, len(jsonResults))
 	fmt.Println()
 
 	return savedProxies, nil
@@ -436,13 +436,8 @@ func (c *ProxyChecker) writeJSON(results []domain.ProxyResult) error {
 	return nil
 }
 
-// groupKey is used to group proxies by public IP and protocol for JSON output
-type groupKey struct {
-	ip    string
-	proto domain.Protocol
-}
-
-// collectResults collects working proxies, grouping them for JSON output.
+// collectResults collects working proxies as a flat list (no grouping).
+// Each working proxy+protocol combination is a separate entry.
 func (c *ProxyChecker) collectResults(workingProxies <-chan WorkingProxy, httpCount, socks4Count, socks5Count *atomic.Int32) (map[domain.Protocol][]domain.Proxy, []domain.ProxyResult) {
 	// For protocol-specific .txt files
 	proxiesByProto := make(map[domain.Protocol][]domain.Proxy)
@@ -450,35 +445,21 @@ func (c *ProxyChecker) collectResults(workingProxies <-chan WorkingProxy, httpCo
 	proxiesByProto[domain.ProtocolSOCKS4] = make([]domain.Proxy, 0, 100)
 	proxiesByProto[domain.ProtocolSOCKS5] = make([]domain.Proxy, 0, 100)
 
-	// For grouped JSON results
-	groupedResults := make(map[groupKey]*domain.ProxyResult)
-	orderedResults := make([]*domain.ProxyResult, 0, 100)
+	// For flat JSON results (no grouping)
+	jsonResults := make([]domain.ProxyResult, 0, 100)
 
 	for wp := range workingProxies {
 		// Store in memory by protocol for .txt files
 		proxiesByProto[wp.Protocol] = append(proxiesByProto[wp.Protocol], wp.Proxy)
 
-		// Group for JSON output
-		key := groupKey{ip: wp.PublicIP, proto: wp.Protocol}
-		if existing, found := groupedResults[key]; found {
-			// Add as an alias to the existing entry
-			existing.Aliases = append(existing.Aliases, domain.Alias{
-				Address:      string(wp.Proxy),
-				SuccessCount: wp.SuccessCount,
-				Latencies:    wp.Latencies,
-			})
-		} else {
-			// Create a new entry
-			newResult := &domain.ProxyResult{
-				Protocol:     string(wp.Protocol),
-				Address:      string(wp.Proxy),
-				PublicIP:     wp.PublicIP,
-				SuccessCount: wp.SuccessCount,
-				Latencies:    wp.Latencies,
-			}
-			groupedResults[key] = newResult
-			orderedResults = append(orderedResults, newResult)
-		}
+		// Add as separate entry to JSON (no grouping)
+		jsonResults = append(jsonResults, domain.ProxyResult{
+			Protocol:     string(wp.Protocol),
+			Address:      string(wp.Proxy),
+			PublicIP:     wp.PublicIP,
+			SuccessCount: wp.SuccessCount,
+			Latencies:    wp.Latencies,
+		})
 
 		// Increment the appropriate protocol counter
 		switch wp.Protocol {
@@ -491,16 +472,10 @@ func (c *ProxyChecker) collectResults(workingProxies <-chan WorkingProxy, httpCo
 		}
 	}
 
-	// Convert slice of pointers to slice of values for the return type
-	finalJSONResults := make([]domain.ProxyResult, len(orderedResults))
-	for i, res := range orderedResults {
-		finalJSONResults[i] = *res
-	}
-
-	return proxiesByProto, finalJSONResults
+	return proxiesByProto, jsonResults
 }
 
-// worker processes proxies from the job channel, always making RetryCount attempts per proxy
+// worker processes proxies from the job channel, testing ALL protocols for each proxy
 func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, workingProxies chan<- WorkingProxy, checked, working, additionalAttempts *atomic.Int32) {
 	for proxy := range jobs {
 		select {
@@ -509,53 +484,42 @@ func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, wor
 		default:
 		}
 
-		var workingProtocol domain.Protocol
-		var publicIP string
-		var successfulAttempts int // Counts successful attempts (max = RetryCount)
-		var allLatencies []float64
-		foundWorkingProtocol := false
+		// Test all protocols for this proxy
+		for _, protocol := range c.protocols {
+			var publicIP string
+			var successfulAttempts int
+			var allLatencies []float64
+			foundWorking := false
 
-		// Always make exactly RetryCount attempts per proxy
-		for attempt := 0; attempt < c.cfg.RetryCount; attempt++ {
-			if attempt > 0 {
-				// Fixed delay between attempts
-				time.Sleep(c.cfg.RetryDelay)
-				additionalAttempts.Add(1)
-			}
-
-			var stats *checkStats
-			var ok bool
-
-			if !foundWorkingProtocol {
-				// First attempt or still searching for a working protocol
-				var protocol domain.Protocol
-				protocol, stats, ok = c.isProxyWorking(ctx, proxy)
-				if ok {
-					workingProtocol = protocol
-					publicIP = stats.publicIP
-					foundWorkingProtocol = true
+			// Make RetryCount attempts for this protocol
+			for attempt := 0; attempt < c.cfg.RetryCount; attempt++ {
+				if attempt > 0 {
+					time.Sleep(c.cfg.RetryDelay)
+					additionalAttempts.Add(1)
 				}
-			} else {
-				// We already found a working protocol, test it again to gather more stats
-				stats, ok = c.checkProtocol(ctx, proxy, workingProtocol)
+
+				stats, ok := c.checkProtocol(ctx, proxy, protocol)
+				if ok && stats != nil {
+					if !foundWorking {
+						publicIP = stats.publicIP
+						foundWorking = true
+					}
+					successfulAttempts++
+					allLatencies = append(allLatencies, stats.latencies...)
+				}
 			}
 
-			if ok && stats != nil {
-				successfulAttempts++ // Increment per successful attempt, not per endpoint
-				allLatencies = append(allLatencies, stats.latencies...)
+			// Report if this protocol works
+			if foundWorking && successfulAttempts > 0 {
+				workingProxies <- WorkingProxy{
+					Proxy:        proxy,
+					Protocol:     protocol,
+					PublicIP:     publicIP,
+					SuccessCount: successfulAttempts,
+					Latencies:    allLatencies,
+				}
+				working.Add(1)
 			}
-		}
-
-		// Report as working if we found a working protocol and had at least one success
-		if foundWorkingProtocol && successfulAttempts > 0 {
-			workingProxies <- WorkingProxy{
-				Proxy:        proxy,
-				Protocol:     workingProtocol,
-				PublicIP:     publicIP,
-				SuccessCount: successfulAttempts, // Now represents successful attempts (1-6)
-				Latencies:    allLatencies,
-			}
-			working.Add(1)
 		}
 
 		checked.Add(1)
@@ -567,46 +531,6 @@ type checkStats struct {
 	publicIP     string
 	successCount int
 	latencies    []float64 // in milliseconds
-}
-
-// isProxyWorking tests if a proxy works with any protocol and returns the working protocol and stats
-func (c *ProxyChecker) isProxyWorking(ctx context.Context, proxy domain.Proxy) (domain.Protocol, *checkStats, bool) {
-	// Test all protocols concurrently
-	type result struct {
-		protocol domain.Protocol
-		stats    *checkStats
-	}
-	resultChan := make(chan result, len(c.protocols))
-	var wg sync.WaitGroup
-
-	for _, protocol := range c.protocols {
-		wg.Add(1)
-		go func(proto domain.Protocol) {
-			defer wg.Done()
-			if stats, ok := c.checkProtocol(ctx, proxy, proto); ok {
-				select {
-				case resultChan <- result{protocol: proto, stats: stats}:
-				default:
-				}
-			}
-		}(protocol)
-	}
-
-	// Wait with early exit on first success
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case res := <-resultChan:
-		return res.protocol, res.stats, true
-	case <-done:
-		return "", nil, false
-	case <-ctx.Done():
-		return "", nil, false
-	}
 }
 
 // checkProtocol tests a proxy with a specific protocol against all endpoints and returns statistics
@@ -751,12 +675,8 @@ func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count
 					chk, total, percentage, bar, overallRate, formatDuration(eta))
 
 				// Line 2: Protocol breakdown
-				successRate := float64(0)
-				if chk > 0 {
-					successRate = float64(wrk) / float64(chk) * 100
-				}
-				fmt.Printf("\r\033[KWorking: %d (%.1f%%) | HTTP: %d | SOCKS4: %d | SOCKS5: %d | Attempts: %d | Failed: %d\033[A",
-					wrk, successRate, http, socks4, socks5, additional+chk, chk-wrk)
+				fmt.Printf("\r\033[KWorking: %d | HTTP: %d | SOCKS4: %d | SOCKS5: %d | Attempts: %d\033[A",
+					wrk, http, socks4, socks5, additional+chk*int32(len(c.protocols)))
 			}
 		}
 	}

@@ -78,20 +78,12 @@ type GeoInfo struct {
 	Abuse    *Abuse   `json:"abuse,omitempty"`
 }
 
-// Alias represents an alternative address for a proxy with the same public IP and protocol
-type Alias struct {
-	Address      string    `json:"address"`
-	SuccessCount int       `json:"success_count,omitempty"`
-	Latencies    []float64 `json:"latencies_ms,omitempty"` // Latencies in milliseconds
-}
-
 // ProxyResult represents a validated proxy with its metadata for JSON output.
-// It groups proxies with the same public IP and protocol using Aliases.
+// Each entry represents a unique proxy+protocol combination.
 type ProxyResult struct {
-	Protocol string  `json:"protocol"`
-	Address  string  `json:"address"`
-	PublicIP string  `json:"public_ip"`
-	Aliases  []Alias `json:"aliases,omitempty"`
+	Protocol string `json:"protocol"`
+	Address  string `json:"address"`
+	PublicIP string `json:"public_ip"`
 
 	// Statistics
 	SuccessCount int       `json:"success_count,omitempty"`
