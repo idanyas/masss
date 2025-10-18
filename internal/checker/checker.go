@@ -21,13 +21,17 @@ import (
 const (
 	// maxResponseSize limits how much we read from check endpoints (IPs are ~20 bytes)
 	maxResponseSize = 1024
+	// maxGeoWorkers limits concurrent geo API requests to avoid rate limiting
+	maxGeoWorkers = 20
 )
 
-// WorkingProxy represents a proxy with its working protocol and public IP
+// WorkingProxy represents a proxy with its working protocol, public IP, and statistics
 type WorkingProxy struct {
-	Proxy    domain.Proxy
-	Protocol domain.Protocol
-	PublicIP string
+	Proxy        domain.Proxy
+	Protocol     domain.Protocol
+	PublicIP     string
+	SuccessCount int
+	Latencies    []float64 // in milliseconds
 }
 
 // ProxyChecker validates proxies against multiple protocols and endpoints
@@ -169,6 +173,14 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 
 	elapsed := time.Since(start)
 
+	// Enrich results with geolocation data if API is configured
+	if c.cfg.GeoAPIBaseURL != "" {
+		fmt.Print("\nEnriching results with geolocation data... ")
+		geoStart := time.Now()
+		c.enrichWithGeoData(ctx, jsonResults)
+		fmt.Printf("done in %.3fs\n", time.Since(geoStart).Seconds())
+	}
+
 	// Write all output files (no sorting)
 	fmt.Print("\nWriting results... ")
 	writeStart := time.Now()
@@ -214,6 +226,113 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 	fmt.Println()
 
 	return savedProxies, nil
+}
+
+// enrichWithGeoData fetches geolocation data for unique IPs and updates results
+func (c *ProxyChecker) enrichWithGeoData(ctx context.Context, results []domain.ProxyResult) {
+	// Collect unique IPs that need geo lookups
+	uniqueIPs := make(map[string]struct{})
+	for i := range results {
+		// Extract proxy IP
+		proxyInfo, err := domain.ParseProxyInfo(results[i].Address)
+		if err == nil {
+			uniqueIPs[proxyInfo.Host] = struct{}{}
+		}
+		// Public IP
+		uniqueIPs[results[i].PublicIP] = struct{}{}
+	}
+
+	if len(uniqueIPs) == 0 {
+		return
+	}
+
+	// Fetch geo data concurrently with limited workers
+	ipList := make([]string, 0, len(uniqueIPs))
+	for ip := range uniqueIPs {
+		ipList = append(ipList, ip)
+	}
+
+	geoCache := &sync.Map{} // map[string]*domain.GeoInfo
+	jobs := make(chan string, len(ipList))
+	var wg sync.WaitGroup
+
+	// Start workers
+	workers := maxGeoWorkers
+	if workers > len(ipList) {
+		workers = len(ipList)
+	}
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ip := range jobs {
+				if geoInfo, err := c.fetchGeoInfo(ip); err == nil && geoInfo != nil {
+					geoCache.Store(ip, geoInfo)
+				}
+			}
+		}()
+	}
+
+	// Send jobs
+	for _, ip := range ipList {
+		select {
+		case jobs <- ip:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	// Update results with geo data
+	for i := range results {
+		// Proxy geo
+		proxyInfo, err := domain.ParseProxyInfo(results[i].Address)
+		if err == nil {
+			if geoData, ok := geoCache.Load(proxyInfo.Host); ok {
+				if geo, ok := geoData.(*domain.GeoInfo); ok {
+					results[i].ProxyGeoInfo = geo
+				}
+			}
+		}
+
+		// Public IP geo
+		if geoData, ok := geoCache.Load(results[i].PublicIP); ok {
+			if geo, ok := geoData.(*domain.GeoInfo); ok {
+				results[i].PublicGeoInfo = geo
+			}
+		}
+	}
+}
+
+// fetchGeoInfo fetches geolocation data for an IP from the configured API
+func (c *ProxyChecker) fetchGeoInfo(ip string) (*domain.GeoInfo, error) {
+	if c.cfg.GeoAPIBaseURL == "" {
+		return nil, nil
+	}
+
+	url := fmt.Sprintf("%s/json/%s", strings.TrimRight(c.cfg.GeoAPIBaseURL, "/"), ip)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bad status: %d", resp.StatusCode)
+	}
+
+	var geoInfo domain.GeoInfo
+	if err := json.NewDecoder(resp.Body).Decode(&geoInfo); err != nil {
+		return nil, err
+	}
+
+	return &geoInfo, nil
 }
 
 // writeResults writes final protocol-specific files (no sorting for speed)
@@ -286,14 +405,19 @@ func (c *ProxyChecker) collectResults(workingProxies <-chan WorkingProxy, httpCo
 		key := groupKey{ip: wp.PublicIP, proto: wp.Protocol}
 		if existing, found := groupedResults[key]; found {
 			// Add as an alias to the existing entry
-			existing.Aliases = append(existing.Aliases, domain.Alias{Address: string(wp.Proxy)})
+			existing.Aliases = append(existing.Aliases, domain.Alias{
+				Address:      string(wp.Proxy),
+				SuccessCount: wp.SuccessCount,
+				Latencies:    wp.Latencies,
+			})
 		} else {
 			// Create a new entry
 			newResult := &domain.ProxyResult{
-				Protocol: string(wp.Protocol),
-				Address:  string(wp.Proxy),
-				PublicIP: wp.PublicIP,
-				// Aliases will be nil, omitted by omitempty
+				Protocol:     string(wp.Protocol),
+				Address:      string(wp.Proxy),
+				PublicIP:     wp.PublicIP,
+				SuccessCount: wp.SuccessCount,
+				Latencies:    wp.Latencies,
 			}
 			groupedResults[key] = newResult
 			orderedResults = append(orderedResults, newResult)
@@ -339,11 +463,13 @@ func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, wor
 			}
 
 			// Check this proxy against all protocols
-			if protocol, publicIP, ok := c.isProxyWorking(ctx, proxy); ok {
+			if protocol, stats, ok := c.isProxyWorking(ctx, proxy); ok {
 				workingProxies <- WorkingProxy{
-					Proxy:    proxy,
-					Protocol: protocol,
-					PublicIP: publicIP,
+					Proxy:        proxy,
+					Protocol:     protocol,
+					PublicIP:     stats.publicIP,
+					SuccessCount: stats.successCount,
+					Latencies:    stats.latencies,
 				}
 				working.Add(1)
 				found = true
@@ -354,12 +480,19 @@ func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, wor
 	}
 }
 
-// isProxyWorking tests if a proxy works with any protocol and returns the working protocol and public IP
-func (c *ProxyChecker) isProxyWorking(ctx context.Context, proxy domain.Proxy) (domain.Protocol, string, bool) {
+// checkStats contains statistics from checking a proxy with a specific protocol
+type checkStats struct {
+	publicIP     string
+	successCount int
+	latencies    []float64 // in milliseconds
+}
+
+// isProxyWorking tests if a proxy works with any protocol and returns the working protocol and stats
+func (c *ProxyChecker) isProxyWorking(ctx context.Context, proxy domain.Proxy) (domain.Protocol, *checkStats, bool) {
 	// Test all protocols concurrently
 	type result struct {
 		protocol domain.Protocol
-		publicIP string
+		stats    *checkStats
 	}
 	resultChan := make(chan result, len(c.protocols))
 	var wg sync.WaitGroup
@@ -368,9 +501,9 @@ func (c *ProxyChecker) isProxyWorking(ctx context.Context, proxy domain.Proxy) (
 		wg.Add(1)
 		go func(proto domain.Protocol) {
 			defer wg.Done()
-			if publicIP, ok := c.checkProtocol(ctx, proxy, proto); ok {
+			if stats, ok := c.checkProtocol(ctx, proxy, proto); ok {
 				select {
-				case resultChan <- result{protocol: proto, publicIP: publicIP}:
+				case resultChan <- result{protocol: proto, stats: stats}:
 				default:
 				}
 			}
@@ -386,55 +519,71 @@ func (c *ProxyChecker) isProxyWorking(ctx context.Context, proxy domain.Proxy) (
 
 	select {
 	case res := <-resultChan:
-		return res.protocol, res.publicIP, true
+		return res.protocol, res.stats, true
 	case <-done:
-		return "", "", false
+		return "", nil, false
 	case <-ctx.Done():
-		return "", "", false
+		return "", nil, false
 	}
 }
 
-// checkProtocol tests a proxy with a specific protocol against all endpoints
-func (c *ProxyChecker) checkProtocol(ctx context.Context, proxy domain.Proxy, protocol domain.Protocol) (string, bool) {
+// checkProtocol tests a proxy with a specific protocol against all endpoints and returns statistics
+func (c *ProxyChecker) checkProtocol(ctx context.Context, proxy domain.Proxy, protocol domain.Protocol) (*checkStats, bool) {
 	client, err := createHTTPClient(string(proxy), protocol, c.cfg.CheckTimeout)
 	if err != nil {
-		return "", false
+		return nil, false
 	}
 	// Explicitly close idle connections when done to free resources immediately
 	defer client.CloseIdleConnections()
 
-	// Try endpoints concurrently
-	resultChan := make(chan string, len(c.cfg.CheckEndpoints))
+	// Test all endpoints concurrently and collect results
+	type endpointResult struct {
+		publicIP string
+		latency  float64
+		success  bool
+	}
+
+	results := make(chan endpointResult, len(c.cfg.CheckEndpoints))
 	var wg sync.WaitGroup
 
 	for _, endpoint := range c.cfg.CheckEndpoints {
 		wg.Add(1)
 		go func(ep string) {
 			defer wg.Done()
+			start := time.Now()
 			if publicIP, ok := c.checkEndpoint(ctx, client, ep); ok {
-				select {
-				case resultChan <- publicIP:
-				default:
-				}
+				latency := time.Since(start).Seconds() * 1000 // convert to milliseconds
+				results <- endpointResult{publicIP: publicIP, latency: latency, success: true}
+			} else {
+				results <- endpointResult{success: false}
 			}
 		}(endpoint)
 	}
 
-	// Wait with early exit on first success
-	done := make(chan struct{})
+	// Wait for all endpoint checks to complete
 	go func() {
 		wg.Wait()
-		close(done)
+		close(results)
 	}()
 
-	select {
-	case publicIP := <-resultChan:
-		return publicIP, true
-	case <-done:
-		return "", false
-	case <-ctx.Done():
-		return "", false
+	stats := &checkStats{
+		latencies: make([]float64, 0, len(c.cfg.CheckEndpoints)),
 	}
+
+	for result := range results {
+		if result.success {
+			stats.successCount++
+			stats.latencies = append(stats.latencies, result.latency)
+			if stats.publicIP == "" {
+				stats.publicIP = result.publicIP
+			}
+		}
+	}
+
+	if stats.successCount > 0 {
+		return stats, true
+	}
+	return nil, false
 }
 
 // checkEndpoint tests a proxy against a specific endpoint and returns the public IP

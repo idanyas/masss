@@ -25,9 +25,64 @@ type ProxySource struct {
 	ParserType string // "default", "json", etc. - extensible
 }
 
+// ASNInfo contains ASN details
+type ASNInfo struct {
+	ASN    string `json:"asn,omitempty"`
+	Name   string `json:"name,omitempty"`
+	Domain string `json:"domain,omitempty"`
+	Route  string `json:"route,omitempty"`
+	Type   string `json:"type,omitempty"`
+}
+
+// Company contains company/organization details
+type Company struct {
+	Name   string `json:"name,omitempty"`
+	Domain string `json:"domain,omitempty"`
+	Type   string `json:"type,omitempty"`
+}
+
+// Privacy contains privacy/security flags
+type Privacy struct {
+	Anycast   bool `json:"anycast,omitempty"`
+	Satellite bool `json:"satellite,omitempty"`
+	Mobile    bool `json:"mobile,omitempty"`
+	VPN       bool `json:"vpn,omitempty"`
+	Proxy     bool `json:"proxy,omitempty"`
+	Tor       bool `json:"tor,omitempty"`
+	Relay     bool `json:"relay,omitempty"`
+	Hosting   bool `json:"hosting,omitempty"`
+}
+
+// Abuse contains abuse contact information
+type Abuse struct {
+	Address string `json:"address,omitempty"`
+	Country string `json:"country,omitempty"`
+	Email   string `json:"email,omitempty"`
+	Name    string `json:"name,omitempty"`
+	Network string `json:"network,omitempty"`
+	Phone   string `json:"phone,omitempty"`
+}
+
+// GeoInfo contains geolocation and network information for an IP
+type GeoInfo struct {
+	IP       string   `json:"ip,omitempty"`
+	City     string   `json:"city,omitempty"`
+	Region   string   `json:"region,omitempty"`
+	Country  string   `json:"country,omitempty"`
+	Loc      string   `json:"loc,omitempty"`
+	Postal   string   `json:"postal,omitempty"`
+	Timezone string   `json:"timezone,omitempty"`
+	ASN      *ASNInfo `json:"asn,omitempty"`
+	Company  *Company `json:"company,omitempty"`
+	Privacy  *Privacy `json:"privacy,omitempty"`
+	Abuse    *Abuse   `json:"abuse,omitempty"`
+}
+
 // Alias represents an alternative address for a proxy with the same public IP and protocol
 type Alias struct {
-	Address string `json:"address"`
+	Address      string    `json:"address"`
+	SuccessCount int       `json:"success_count,omitempty"`
+	Latencies    []float64 `json:"latencies_ms,omitempty"` // Latencies in milliseconds
 }
 
 // ProxyResult represents a validated proxy with its metadata for JSON output.
@@ -37,6 +92,16 @@ type ProxyResult struct {
 	Address  string  `json:"address"`
 	PublicIP string  `json:"public_ip"`
 	Aliases  []Alias `json:"aliases,omitempty"`
+
+	// Statistics
+	SuccessCount int       `json:"success_count,omitempty"`
+	Latencies    []float64 `json:"latencies_ms,omitempty"` // Latencies in milliseconds
+
+	// Geolocation for proxy's own IP address
+	ProxyGeoInfo *GeoInfo `json:"proxy_geo,omitempty"`
+
+	// Geolocation for proxy's public/outbound IP
+	PublicGeoInfo *GeoInfo `json:"public_geo,omitempty"`
 }
 
 // ProxyInfo contains parsed proxy components

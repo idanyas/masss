@@ -1,6 +1,9 @@
 package config
 
-import "time"
+import (
+	"os"
+	"time"
+)
 
 // Config holds application configuration
 type Config struct {
@@ -15,6 +18,9 @@ type Config struct {
 	CheckEndpoints []string
 	RetryCount     int           // Number of retry attempts for failed proxies
 	RetryDelay     time.Duration // Base delay between retries (exponential backoff)
+
+	// Geolocation API (optional - from IDAI environment variable)
+	GeoAPIBaseURL string
 }
 
 // Default returns default configuration
@@ -29,7 +35,8 @@ func Default() *Config {
 			"https://checkip.amazonaws.com/",
 			"https://whatismyip.akamai.com/",
 		},
-		RetryCount: 3,                     // Retry up to 3 times
-		RetryDelay: 50 * time.Millisecond, // Start with 50ms, exponential backoff
+		RetryCount:    3,                     // Retry up to 3 times
+		RetryDelay:    50 * time.Millisecond, // Start with 50ms, exponential backoff
+		GeoAPIBaseURL: os.Getenv("IDAI"),     // Read from environment variable
 	}
 }

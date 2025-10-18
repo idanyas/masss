@@ -37,6 +37,8 @@ jobs:
           echo "Starting proxy scraper..."
           go run main.go
         continue-on-error: true # Don't fail workflow if no proxies found
+        env:
+          IDAI: ${{ secrets.IDAI }}
 
       - name: Publish results to results branch
         if: steps.scraper.outcome == 'success'
@@ -134,8 +136,25 @@ jobs:
               "protocol": "http",
               "address": "1.2.3.4:8080",
               "public_ip": "1.2.3.4",
+              "success_count": 2,
+              "latencies_ms": [125.5, 142.3],
+              "proxy_geo": {
+                "ip": "1.2.3.4",
+                "city": "New York",
+                "country": "US",
+                "asn": {"asn": "AS12345", "name": "Example ISP"}
+              },
+              "public_geo": {
+                "ip": "5.6.7.8",
+                "city": "London",
+                "country": "GB"
+              },
               "aliases": [
-                {"address": "1.2.3.4:8081"}
+                {
+                  "address": "1.2.3.4:8081",
+                  "success_count": 1,
+                  "latencies_ms": [156.2]
+                }
               ]
             }
           ]
