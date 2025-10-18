@@ -21,8 +21,14 @@ import (
 const (
 	// maxResponseSize limits how much we read from check endpoints (IPs are ~20 bytes)
 	maxResponseSize = 1024
-	// maxGeoWorkers limits concurrent geo API requests to avoid rate limiting
-	maxGeoWorkers = 20
+	// maxGeoWorkers limits concurrent geo API requests to avoid overwhelming slow APIs
+	maxGeoWorkers = 10
+	// geoAPITimeout is the timeout for each geo API request
+	geoAPITimeout = 30 * time.Second
+	// geoRetryAttempts is the number of retry attempts for geo lookups
+	geoRetryAttempts = 3
+	// geoRetryDelay is the delay between geo lookup retries
+	geoRetryDelay = 2 * time.Second
 )
 
 // WorkingProxy represents a proxy with its working protocol, public IP, and statistics
@@ -113,7 +119,7 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 	fmt.Printf("Starting proxy validation with %d workers...\n", c.cfg.CheckerWorkers)
 	fmt.Printf("Testing %d proxies against %d protocols and %d endpoints\n",
 		len(proxies), len(c.protocols), len(c.cfg.CheckEndpoints))
-	fmt.Printf("Retry policy: up to %d attempts per proxy\n", c.cfg.RetryCount)
+	fmt.Printf("Validation strategy: %d attempts per proxy for comprehensive statistics\n", c.cfg.RetryCount)
 	fmt.Printf("Writing working proxies to: %s/\n\n", outputDir)
 
 	start := time.Now()
@@ -125,7 +131,7 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 	// Progress tracking
 	var checked, workingTotal atomic.Int32
 	var httpCount, socks4Count, socks5Count atomic.Int32
-	var retryAttempts atomic.Int32
+	var additionalAttempts atomic.Int32
 
 	// Start result collector (collects in memory, no file writes)
 	collectorDone := make(chan struct{})
@@ -142,13 +148,13 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c.worker(ctx, jobs, workingProxies, &checked, &workingTotal, &retryAttempts)
+			c.worker(ctx, jobs, workingProxies, &checked, &workingTotal, &additionalAttempts)
 		}()
 	}
 
 	// Progress reporter
 	progressDone := make(chan struct{})
-	go c.progressReporter(&checked, &workingTotal, &httpCount, &socks4Count, &socks5Count, &retryAttempts, len(proxies), progressDone)
+	go c.progressReporter(&checked, &workingTotal, &httpCount, &socks4Count, &socks5Count, &additionalAttempts, len(proxies), progressDone)
 
 	// Send jobs
 	go func() {
@@ -210,7 +216,8 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 	fmt.Printf("  Total checked: %d\n", len(proxies))
 	fmt.Printf("  Working: %d (%.1f%%)\n", totalWorking, float64(totalWorking)/float64(len(proxies))*100)
 	fmt.Printf("  Failed: %d\n", len(proxies)-totalWorking)
-	fmt.Printf("  Retry attempts: %d\n", retryAttempts.Load())
+	fmt.Printf("  Total validation attempts: %d\n", additionalAttempts.Load()+int32(len(proxies)))
+	fmt.Printf("  Average attempts per proxy: %.1f\n", float64(additionalAttempts.Load()+int32(len(proxies)))/float64(len(proxies)))
 	fmt.Printf("  Speed: %.0f proxies/second\n\n", float64(len(proxies))/elapsed.Seconds())
 
 	// Per-protocol breakdown
@@ -246,6 +253,8 @@ func (c *ProxyChecker) enrichWithGeoData(ctx context.Context, results []domain.P
 		return
 	}
 
+	fmt.Printf("\n  Fetching geo data for %d unique IPs...\n", len(uniqueIPs))
+
 	// Fetch geo data concurrently with limited workers
 	ipList := make([]string, 0, len(uniqueIPs))
 	for ip := range uniqueIPs {
@@ -255,6 +264,27 @@ func (c *ProxyChecker) enrichWithGeoData(ctx context.Context, results []domain.P
 	geoCache := &sync.Map{} // map[string]*domain.GeoInfo
 	jobs := make(chan string, len(ipList))
 	var wg sync.WaitGroup
+	var completed, successful atomic.Int32
+
+	// Progress reporter for geo enrichment
+	geoDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-geoDone:
+				return
+			case <-ticker.C:
+				c := completed.Load()
+				s := successful.Load()
+				if c > 0 {
+					fmt.Printf("\r  Geo progress: %d/%d IPs completed (%d successful, %d failed)",
+						c, len(ipList), s, c-s)
+				}
+			}
+		}
+	}()
 
 	// Start workers
 	workers := maxGeoWorkers
@@ -267,9 +297,29 @@ func (c *ProxyChecker) enrichWithGeoData(ctx context.Context, results []domain.P
 		go func() {
 			defer wg.Done()
 			for ip := range jobs {
-				if geoInfo, err := c.fetchGeoInfo(ip); err == nil && geoInfo != nil {
-					geoCache.Store(ip, geoInfo)
+				var geoInfo *domain.GeoInfo
+				var lastErr error
+
+				// Try up to geoRetryAttempts times
+				for attempt := 0; attempt < geoRetryAttempts; attempt++ {
+					if attempt > 0 {
+						time.Sleep(geoRetryDelay)
+					}
+
+					geoInfo, lastErr = c.fetchGeoInfo(ip)
+					if lastErr == nil && geoInfo != nil {
+						geoCache.Store(ip, geoInfo)
+						successful.Add(1)
+						break
+					}
 				}
+
+				if lastErr != nil && geoInfo == nil {
+					fmt.Printf("\n  Warning: Failed to fetch geo data for %s after %d attempts: %v",
+						ip, geoRetryAttempts, lastErr)
+				}
+
+				completed.Add(1)
 			}
 		}()
 	}
@@ -281,11 +331,18 @@ func (c *ProxyChecker) enrichWithGeoData(ctx context.Context, results []domain.P
 		case <-ctx.Done():
 			close(jobs)
 			wg.Wait()
+			close(geoDone)
 			return
 		}
 	}
 	close(jobs)
 	wg.Wait()
+	close(geoDone)
+
+	// Clear progress line
+	fmt.Print("\r\033[K")
+	fmt.Printf("  ✓ Geo enrichment complete: %d/%d IPs successful\n",
+		successful.Load(), len(ipList))
 
 	// Update results with geo data
 	for i := range results {
@@ -316,7 +373,7 @@ func (c *ProxyChecker) fetchGeoInfo(ip string) (*domain.GeoInfo, error) {
 
 	url := fmt.Sprintf("%s/json/%s", strings.TrimRight(c.cfg.GeoAPIBaseURL, "/"), ip)
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: geoAPITimeout}
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
@@ -443,8 +500,8 @@ func (c *ProxyChecker) collectResults(workingProxies <-chan WorkingProxy, httpCo
 	return proxiesByProto, finalJSONResults
 }
 
-// worker processes proxies from the job channel with retry logic
-func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, workingProxies chan<- WorkingProxy, checked, working, retries *atomic.Int32) {
+// worker processes proxies from the job channel, always making RetryCount attempts per proxy
+func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, workingProxies chan<- WorkingProxy, checked, working, additionalAttempts *atomic.Int32) {
 	for proxy := range jobs {
 		select {
 		case <-ctx.Done():
@@ -452,28 +509,53 @@ func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, wor
 		default:
 		}
 
-		// Try to validate this proxy with retries
-		found := false
-		for attempt := 0; attempt < c.cfg.RetryCount && !found; attempt++ {
+		var workingProtocol domain.Protocol
+		var publicIP string
+		var totalSuccessCount int
+		var allLatencies []float64
+		foundWorkingProtocol := false
+
+		// Always make exactly RetryCount attempts per proxy
+		for attempt := 0; attempt < c.cfg.RetryCount; attempt++ {
 			if attempt > 0 {
-				retries.Add(1)
-				// Exponential backoff: 50ms, 100ms, 200ms
-				delay := c.cfg.RetryDelay * time.Duration(1<<uint(attempt-1))
-				time.Sleep(delay)
+				// Fixed delay between attempts
+				time.Sleep(c.cfg.RetryDelay)
+				additionalAttempts.Add(1)
 			}
 
-			// Check this proxy against all protocols
-			if protocol, stats, ok := c.isProxyWorking(ctx, proxy); ok {
-				workingProxies <- WorkingProxy{
-					Proxy:        proxy,
-					Protocol:     protocol,
-					PublicIP:     stats.publicIP,
-					SuccessCount: stats.successCount,
-					Latencies:    stats.latencies,
+			var stats *checkStats
+			var ok bool
+
+			if !foundWorkingProtocol {
+				// First attempt or still searching for a working protocol
+				var protocol domain.Protocol
+				protocol, stats, ok = c.isProxyWorking(ctx, proxy)
+				if ok {
+					workingProtocol = protocol
+					publicIP = stats.publicIP
+					foundWorkingProtocol = true
 				}
-				working.Add(1)
-				found = true
+			} else {
+				// We already found a working protocol, test it again to gather more stats
+				stats, ok = c.checkProtocol(ctx, proxy, workingProtocol)
 			}
+
+			if ok && stats != nil {
+				totalSuccessCount += stats.successCount
+				allLatencies = append(allLatencies, stats.latencies...)
+			}
+		}
+
+		// Report as working if we found a working protocol and had at least one success
+		if foundWorkingProtocol && totalSuccessCount > 0 {
+			workingProxies <- WorkingProxy{
+				Proxy:        proxy,
+				Protocol:     workingProtocol,
+				PublicIP:     publicIP,
+				SuccessCount: totalSuccessCount,
+				Latencies:    allLatencies,
+			}
+			working.Add(1)
 		}
 
 		checked.Add(1)
@@ -626,7 +708,7 @@ func (c *ProxyChecker) checkEndpoint(ctx context.Context, client *http.Client, e
 }
 
 // progressReporter prints periodic progress updates with stable ETA calculation
-func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count, socks5Count, retries *atomic.Int32, total int, done <-chan struct{}) {
+func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count, socks5Count, additionalAttempts *atomic.Int32, total int, done <-chan struct{}) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -642,7 +724,7 @@ func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count
 			http := httpCount.Load()
 			socks4 := socks4Count.Load()
 			socks5 := socks5Count.Load()
-			retry := retries.Load()
+			additional := additionalAttempts.Load()
 
 			if chk > 0 {
 				// Calculate overall average rate from start (stable and accurate)
@@ -673,8 +755,8 @@ func (c *ProxyChecker) progressReporter(checked, working, httpCount, socks4Count
 				if chk > 0 {
 					successRate = float64(wrk) / float64(chk) * 100
 				}
-				fmt.Printf("\r\033[KWorking: %d (%.1f%%) | HTTP: %d | SOCKS4: %d | SOCKS5: %d | Retries: %d | Failed: %d\033[A",
-					wrk, successRate, http, socks4, socks5, retry, chk-wrk)
+				fmt.Printf("\r\033[KWorking: %d (%.1f%%) | HTTP: %d | SOCKS4: %d | SOCKS5: %d | Attempts: %d | Failed: %d\033[A",
+					wrk, successRate, http, socks4, socks5, additional+chk, chk-wrk)
 			}
 		}
 	}
