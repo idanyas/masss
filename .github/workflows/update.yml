@@ -61,14 +61,9 @@ jobs:
           # Fetch all branches
           git fetch origin
 
-          # Switch to results branch (create orphan if doesn't exist)
-          if git rev-parse --verify origin/results >/dev/null 2>&1; then
-            echo "📍 Switching to existing results branch..."
-            git checkout -f results
-          else
-            echo "📍 Creating new orphan results branch..."
-            git checkout --orphan results
-          fi
+          # Always create orphan branch (no history)
+          echo "📍 Creating fresh results branch (no history)..."
+          git checkout --orphan results
 
           # Clean the branch completely (keep only .git)
           echo "🧹 Cleaning branch..."
