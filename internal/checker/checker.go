@@ -21,8 +21,8 @@ import (
 const (
 	// maxResponseSize limits how much we read from check endpoints (IPs are ~20 bytes)
 	maxResponseSize = 1024
-	// maxGeoWorkers limits concurrent geo API requests to avoid overwhelming slow APIs
-	maxGeoWorkers = 10
+	// maxGeoWorkers limits concurrent geo API requests
+	maxGeoWorkers = 32
 	// geoAPITimeout is the timeout for each geo API request
 	geoAPITimeout = 30 * time.Second
 	// geoRetryAttempts is the number of retry attempts for geo lookups
@@ -511,7 +511,7 @@ func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, wor
 
 		var workingProtocol domain.Protocol
 		var publicIP string
-		var totalSuccessCount int
+		var successfulAttempts int // Counts successful attempts (max = RetryCount)
 		var allLatencies []float64
 		foundWorkingProtocol := false
 
@@ -541,18 +541,18 @@ func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, wor
 			}
 
 			if ok && stats != nil {
-				totalSuccessCount += stats.successCount
+				successfulAttempts++ // Increment per successful attempt, not per endpoint
 				allLatencies = append(allLatencies, stats.latencies...)
 			}
 		}
 
 		// Report as working if we found a working protocol and had at least one success
-		if foundWorkingProtocol && totalSuccessCount > 0 {
+		if foundWorkingProtocol && successfulAttempts > 0 {
 			workingProxies <- WorkingProxy{
 				Proxy:        proxy,
 				Protocol:     workingProtocol,
 				PublicIP:     publicIP,
-				SuccessCount: totalSuccessCount,
+				SuccessCount: successfulAttempts, // Now represents successful attempts (1-6)
 				Latencies:    allLatencies,
 			}
 			working.Add(1)
