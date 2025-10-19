@@ -29,15 +29,23 @@ const (
 	geoRetryAttempts = 3
 	// geoRetryDelay is the delay between geo lookup retries
 	geoRetryDelay = 2 * time.Second
+
+	// Endpoint identifiers for validation rules
+	endpointAmazon    = "https://checkip.amazonaws.com/"
+	endpointAkamai    = "https://whatismyip.akamai.com/"
+	endpointIcanhazip = "https://icanhazip.com"
 )
 
 // WorkingProxy represents a proxy with its working protocol, public IP, and statistics
 type WorkingProxy struct {
-	Proxy        domain.Proxy
-	Protocol     domain.Protocol
-	PublicIP     string
-	SuccessCount int
-	Latencies    []float64 // in milliseconds
+	Proxy          domain.Proxy
+	Protocol       domain.Protocol
+	PublicIP       string
+	SuccessCount   int       // Total successful endpoint checks across all attempts
+	Latencies      []float64 // in milliseconds
+	AmazonValid    bool      // Amazon endpoint succeeded at least once
+	AkamaiValid    bool      // Akamai endpoint succeeded at least once
+	IcanhaziPValid bool      // Icanhazip endpoint succeeded at least once
 }
 
 // ProxyChecker validates proxies against multiple protocols and endpoints
@@ -454,11 +462,14 @@ func (c *ProxyChecker) collectResults(workingProxies <-chan WorkingProxy, httpCo
 
 		// Add as separate entry to JSON (no grouping)
 		jsonResults = append(jsonResults, domain.ProxyResult{
-			Protocol:     string(wp.Protocol),
-			Address:      string(wp.Proxy),
-			PublicIP:     wp.PublicIP,
-			SuccessCount: wp.SuccessCount,
-			Latencies:    wp.Latencies,
+			Protocol:       string(wp.Protocol),
+			Address:        string(wp.Proxy),
+			PublicIP:       wp.PublicIP,
+			SuccessCount:   wp.SuccessCount,
+			Latencies:      wp.Latencies,
+			AmazonValid:    wp.AmazonValid,
+			AkamaiValid:    wp.AkamaiValid,
+			IcanhaziPValid: wp.IcanhaziPValid,
 		})
 
 		// Increment the appropriate protocol counter
@@ -487,8 +498,9 @@ func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, wor
 		// Test all protocols for this proxy
 		for _, protocol := range c.protocols {
 			var publicIP string
-			var successfulAttempts int
+			var totalSuccessCount int
 			var allLatencies []float64
+			var amazonValid, akamaiValid, icanhaziPValid bool
 			foundWorking := false
 
 			// Make RetryCount attempts for this protocol
@@ -504,19 +516,27 @@ func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, wor
 						publicIP = stats.publicIP
 						foundWorking = true
 					}
-					successfulAttempts++
+					totalSuccessCount += stats.successCount
 					allLatencies = append(allLatencies, stats.latencies...)
+
+					// Aggregate endpoint flags (OR operation - true if succeeded at least once)
+					amazonValid = amazonValid || stats.amazonValid
+					akamaiValid = akamaiValid || stats.akamaiValid
+					icanhaziPValid = icanhaziPValid || stats.icanhaziPValid
 				}
 			}
 
-			// Report if this protocol works
-			if foundWorking && successfulAttempts > 0 {
+			// Report if this protocol works (at least one endpoint succeeded)
+			if foundWorking && totalSuccessCount > 0 {
 				workingProxies <- WorkingProxy{
-					Proxy:        proxy,
-					Protocol:     protocol,
-					PublicIP:     publicIP,
-					SuccessCount: successfulAttempts,
-					Latencies:    allLatencies,
+					Proxy:          proxy,
+					Protocol:       protocol,
+					PublicIP:       publicIP,
+					SuccessCount:   totalSuccessCount,
+					Latencies:      allLatencies,
+					AmazonValid:    amazonValid,
+					AkamaiValid:    akamaiValid,
+					IcanhaziPValid: icanhaziPValid,
 				}
 				working.Add(1)
 			}
@@ -528,9 +548,12 @@ func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, wor
 
 // checkStats contains statistics from checking a proxy with a specific protocol
 type checkStats struct {
-	publicIP     string
-	successCount int
-	latencies    []float64 // in milliseconds
+	publicIP       string
+	successCount   int       // Number of successful endpoint checks in this attempt
+	latencies      []float64 // in milliseconds
+	amazonValid    bool      // Amazon endpoint succeeded
+	akamaiValid    bool      // Akamai endpoint succeeded
+	icanhaziPValid bool      // Icanhazip endpoint succeeded
 }
 
 // checkProtocol tests a proxy with a specific protocol against all endpoints and returns statistics
@@ -544,6 +567,7 @@ func (c *ProxyChecker) checkProtocol(ctx context.Context, proxy domain.Proxy, pr
 
 	// Test all endpoints concurrently and collect results
 	type endpointResult struct {
+		endpoint string
 		publicIP string
 		latency  float64
 		success  bool
@@ -559,9 +583,9 @@ func (c *ProxyChecker) checkProtocol(ctx context.Context, proxy domain.Proxy, pr
 			start := time.Now()
 			if publicIP, ok := c.checkEndpoint(ctx, client, ep); ok {
 				latency := time.Since(start).Seconds() * 1000 // convert to milliseconds
-				results <- endpointResult{publicIP: publicIP, latency: latency, success: true}
+				results <- endpointResult{endpoint: ep, publicIP: publicIP, latency: latency, success: true}
 			} else {
-				results <- endpointResult{success: false}
+				results <- endpointResult{endpoint: ep, success: false}
 			}
 		}(endpoint)
 	}
@@ -583,6 +607,16 @@ func (c *ProxyChecker) checkProtocol(ctx context.Context, proxy domain.Proxy, pr
 			if stats.publicIP == "" {
 				stats.publicIP = result.publicIP
 			}
+
+			// Track which endpoint succeeded
+			switch result.endpoint {
+			case endpointAmazon:
+				stats.amazonValid = true
+			case endpointAkamai:
+				stats.akamaiValid = true
+			case endpointIcanhazip:
+				stats.icanhaziPValid = true
+			}
 		}
 	}
 
@@ -592,7 +626,7 @@ func (c *ProxyChecker) checkProtocol(ctx context.Context, proxy domain.Proxy, pr
 	return nil, false
 }
 
-// checkEndpoint tests a proxy against a specific endpoint and returns the public IP
+// checkEndpoint tests a proxy against a specific endpoint with endpoint-specific validation rules
 func (c *ProxyChecker) checkEndpoint(ctx context.Context, client *http.Client, endpoint string) (string, bool) {
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
@@ -613,7 +647,7 @@ func (c *ProxyChecker) checkEndpoint(ctx context.Context, client *http.Client, e
 
 	returnedIP := strings.TrimSpace(string(body))
 
-	// Check if IP is valid and different from host
+	// Check if IP is valid
 	if returnedIP == "" {
 		return "", false
 	}
@@ -623,12 +657,26 @@ func (c *ProxyChecker) checkEndpoint(ctx context.Context, client *http.Client, e
 		return "", false
 	}
 
-	// Reject if same as host IP
-	if _, isHostIP := c.hostIPs[returnedIP]; isHostIP {
-		return "", false
-	}
+	// Apply endpoint-specific validation rules
+	switch endpoint {
+	case endpointAmazon, endpointAkamai:
+		// Accept any valid IPv4, don't check if it's a host IP
+		return returnedIP, true
 
-	return returnedIP, true
+	case endpointIcanhazip:
+		// Only accept if it's NOT a host IP
+		if _, isHostIP := c.hostIPs[returnedIP]; isHostIP {
+			return "", false
+		}
+		return returnedIP, true
+
+	default:
+		// For any unknown endpoints, use conservative logic (reject host IPs)
+		if _, isHostIP := c.hostIPs[returnedIP]; isHostIP {
+			return "", false
+		}
+		return returnedIP, true
+	}
 }
 
 // progressReporter prints periodic progress updates with stable ETA calculation

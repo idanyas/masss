@@ -34,6 +34,7 @@ func Default() *Config {
 		CheckEndpoints: []string{
 			"https://checkip.amazonaws.com/",
 			"https://whatismyip.akamai.com/",
+			"https://icanhazip.com",
 		},
 		RetryCount:    6,                     // Always make 6 validation attempts per proxy
 		RetryDelay:    50 * time.Millisecond, // Fixed delay between attempts

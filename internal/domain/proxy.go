@@ -85,9 +85,14 @@ type ProxyResult struct {
 	Address  string `json:"address"`
 	PublicIP string `json:"public_ip"`
 
-	// Statistics
-	SuccessCount int       `json:"success_count,omitempty"`
-	Latencies    []float64 `json:"latencies_ms,omitempty"` // Latencies in milliseconds
+	// Per-endpoint validation results
+	AmazonValid    bool `json:"amazon_valid"`
+	AkamaiValid    bool `json:"akamai_valid"`
+	IcanhaziPValid bool `json:"icanhazip_valid"`
+
+	// Statistics (success_count equals the number of latencies)
+	SuccessCount int       `json:"success_count,omitempty"` // Total successful endpoint checks
+	Latencies    []float64 `json:"latencies_ms,omitempty"`  // Latencies in milliseconds
 
 	// Geolocation for proxy's own IP address
 	ProxyGeoInfo *GeoInfo `json:"proxy_geo,omitempty"`
