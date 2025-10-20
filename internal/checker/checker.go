@@ -425,14 +425,14 @@ func (c *ProxyChecker) writeResults(savedProxies map[domain.Protocol][]domain.Pr
 	return nil
 }
 
-// writeJSON writes JSON results (no sorting for speed)
+// writeJSON writes JSON results in compact format (no indentation for minimal file size)
 func (c *ProxyChecker) writeJSON(results []domain.ProxyResult) error {
 	if len(results) == 0 {
 		return nil
 	}
 
-	// Write formatted JSON without sorting
-	data, err := json.MarshalIndent(results, "", "  ")
+	// Write compact JSON without indentation
+	data, err := json.Marshal(results)
 	if err != nil {
 		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
