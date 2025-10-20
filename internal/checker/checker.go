@@ -487,8 +487,8 @@ func (c *ProxyChecker) collectResults(workingProxies <-chan WorkingProxy, httpCo
 	return proxiesByProto, jsonResults
 }
 
-// worker processes proxies from the job channel, testing ALL protocols for each proxy
-// Optimized with early termination: dead proxies fail fast, working proxies get full retry validation
+// worker processes proxies from the job channel, testing ALL protocols in parallel
+// Optimized: Tests all 3 protocols concurrently for maximum speed
 func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, workingProxies chan<- WorkingProxy, checked, working, additionalAttempts *atomic.Int32) {
 	for proxy := range jobs {
 		select {
@@ -497,62 +497,82 @@ func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, wor
 		default:
 		}
 
-		// Test all protocols for this proxy
+		// Test all protocols in parallel (major speedup: 3x faster than sequential)
+		var wg sync.WaitGroup
 		for _, protocol := range c.protocols {
-			var publicIP string
-			var totalSuccessCount int
-			var allLatencies []float64
-			var amazonValid, akamaiValid, icanhaziPValid bool
-			foundWorking := false
-
-			// First attempt - always performed
-			stats, ok := c.checkProtocol(ctx, proxy, protocol)
-			if ok && stats != nil {
-				publicIP = stats.publicIP
-				foundWorking = true
-				totalSuccessCount += stats.successCount
-				allLatencies = append(allLatencies, stats.latencies...)
-				amazonValid = stats.amazonValid
-				akamaiValid = stats.akamaiValid
-				icanhaziPValid = stats.icanhaziPValid
-
-				// Proxy works with this protocol - perform additional attempts for statistics
-				for attempt := 1; attempt < c.cfg.RetryCount; attempt++ {
-					time.Sleep(c.cfg.RetryDelay)
-					additionalAttempts.Add(1)
-
-					stats, ok := c.checkProtocol(ctx, proxy, protocol)
-					if ok && stats != nil {
-						totalSuccessCount += stats.successCount
-						allLatencies = append(allLatencies, stats.latencies...)
-
-						// Aggregate endpoint flags (OR operation)
-						amazonValid = amazonValid || stats.amazonValid
-						akamaiValid = akamaiValid || stats.akamaiValid
-						icanhaziPValid = icanhaziPValid || stats.icanhaziPValid
-					}
-				}
-			}
-			// If first attempt failed (ok == false), skip remaining attempts for this protocol
-			// This is the key optimization: dead proxies fail fast
-
-			// Report if this protocol works
-			if foundWorking && totalSuccessCount > 0 {
-				workingProxies <- WorkingProxy{
-					Proxy:          proxy,
-					Protocol:       protocol,
-					PublicIP:       publicIP,
-					SuccessCount:   totalSuccessCount,
-					Latencies:      allLatencies,
-					AmazonValid:    amazonValid,
-					AkamaiValid:    akamaiValid,
-					IcanhaziPValid: icanhaziPValid,
-				}
-				working.Add(1)
-			}
+			wg.Add(1)
+			go func(proto domain.Protocol) {
+				defer wg.Done()
+				c.testProtocol(ctx, proxy, proto, workingProxies, working, additionalAttempts)
+			}(protocol)
 		}
+		wg.Wait()
 
 		checked.Add(1)
+	}
+}
+
+// testProtocol tests a single protocol for a proxy with retries
+// Optimized: Reuses HTTP client across all retry attempts
+func (c *ProxyChecker) testProtocol(ctx context.Context, proxy domain.Proxy, protocol domain.Protocol, workingProxies chan<- WorkingProxy, working, additionalAttempts *atomic.Int32) {
+	// Create client once for all retry attempts (eliminates 2 client creations for RetryCount=3)
+	client, err := createHTTPClient(string(proxy), protocol, c.cfg.CheckTimeout)
+	if err != nil {
+		return
+	}
+	defer client.CloseIdleConnections()
+
+	var publicIP string
+	var totalSuccessCount int
+	// Pre-allocate with expected capacity to reduce allocations
+	allLatencies := make([]float64, 0, c.cfg.RetryCount*len(c.cfg.CheckEndpoints))
+	var amazonValid, akamaiValid, icanhaziPValid bool
+	foundWorking := false
+
+	// First attempt - always performed
+	stats, ok := c.checkProtocolWithClient(ctx, client)
+	if ok && stats != nil {
+		publicIP = stats.publicIP
+		foundWorking = true
+		totalSuccessCount += stats.successCount
+		allLatencies = append(allLatencies, stats.latencies...)
+		amazonValid = stats.amazonValid
+		akamaiValid = stats.akamaiValid
+		icanhaziPValid = stats.icanhaziPValid
+
+		// Proxy works - perform additional attempts for statistics
+		// Optimized: No delay between retries (saves 100ms per working proxy)
+		// The delay doesn't help validation - we're just gathering stats from the same proxy
+		for attempt := 1; attempt < c.cfg.RetryCount; attempt++ {
+			additionalAttempts.Add(1)
+
+			stats, ok := c.checkProtocolWithClient(ctx, client)
+			if ok && stats != nil {
+				totalSuccessCount += stats.successCount
+				allLatencies = append(allLatencies, stats.latencies...)
+
+				// Aggregate endpoint flags (OR operation)
+				amazonValid = amazonValid || stats.amazonValid
+				akamaiValid = akamaiValid || stats.akamaiValid
+				icanhaziPValid = icanhaziPValid || stats.icanhaziPValid
+			}
+		}
+	}
+	// If first attempt failed, skip remaining attempts (fail-fast optimization)
+
+	// Report if this protocol works
+	if foundWorking && totalSuccessCount > 0 {
+		workingProxies <- WorkingProxy{
+			Proxy:          proxy,
+			Protocol:       protocol,
+			PublicIP:       publicIP,
+			SuccessCount:   totalSuccessCount,
+			Latencies:      allLatencies,
+			AmazonValid:    amazonValid,
+			AkamaiValid:    akamaiValid,
+			IcanhaziPValid: icanhaziPValid,
+		}
+		working.Add(1)
 	}
 }
 
@@ -566,15 +586,8 @@ type checkStats struct {
 	icanhaziPValid bool      // Icanhazip endpoint succeeded
 }
 
-// checkProtocol tests a proxy with a specific protocol against all endpoints and returns statistics
-func (c *ProxyChecker) checkProtocol(ctx context.Context, proxy domain.Proxy, protocol domain.Protocol) (*checkStats, bool) {
-	client, err := createHTTPClient(string(proxy), protocol, c.cfg.CheckTimeout)
-	if err != nil {
-		return nil, false
-	}
-	// Explicitly close idle connections when done to free resources immediately
-	defer client.CloseIdleConnections()
-
+// checkProtocolWithClient tests a proxy with a specific protocol against all endpoints using a pre-created client
+func (c *ProxyChecker) checkProtocolWithClient(ctx context.Context, client *http.Client) (*checkStats, bool) {
 	// Test all endpoints concurrently and collect results
 	type endpointResult struct {
 		endpoint string
