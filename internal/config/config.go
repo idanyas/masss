@@ -16,7 +16,7 @@ type Config struct {
 	CheckerWorkers int
 	CheckTimeout   time.Duration
 	CheckEndpoints []string
-	RetryCount     int           // Number of validation attempts per proxy (always performed)
+	RetryCount     int           // Number of validation attempts per proxy (for working proxies)
 	RetryDelay     time.Duration // Delay between validation attempts
 
 	// Geolocation API (optional - from IDAI environment variable)
@@ -29,15 +29,15 @@ func Default() *Config {
 		OutputFile:     "all.txt",
 		OutputDir:      "result",
 		ResultJSONFile: "result/all.json",
-		CheckerWorkers: 36000,
-		CheckTimeout:   8 * time.Second, // Reduced from 10s for faster failure detection
+		CheckerWorkers: 24000,
+		CheckTimeout:   5 * time.Second,
 		CheckEndpoints: []string{
 			"https://checkip.amazonaws.com/",
 			"https://whatismyip.akamai.com/",
 			"https://icanhazip.com",
 		},
-		RetryCount:    6,                     // Always make 6 validation attempts per proxy
-		RetryDelay:    50 * time.Millisecond, // Fixed delay between attempts
-		GeoAPIBaseURL: os.Getenv("IDAI"),     // Read from environment variable
+		RetryCount:    3,
+		RetryDelay:    50 * time.Millisecond,
+		GeoAPIBaseURL: os.Getenv("IDAI"),
 	}
 }

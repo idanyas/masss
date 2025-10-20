@@ -127,7 +127,8 @@ func (c *ProxyChecker) Check(ctx context.Context, proxies []domain.Proxy, output
 	fmt.Printf("Starting proxy validation with %d workers...\n", c.cfg.CheckerWorkers)
 	fmt.Printf("Testing %d proxies against %d protocols and %d endpoints\n",
 		len(proxies), len(c.protocols), len(c.cfg.CheckEndpoints))
-	fmt.Printf("Validation strategy: %d attempts per proxy+protocol for comprehensive statistics\n", c.cfg.RetryCount)
+	fmt.Printf("Validation strategy: Up to %d attempts per working proxy+protocol for statistics\n", c.cfg.RetryCount)
+	fmt.Printf("Dead proxies fail fast after first attempt for maximum speed\n")
 	fmt.Printf("Writing working proxies to: %s/\n\n", outputDir)
 
 	start := time.Now()
@@ -487,6 +488,7 @@ func (c *ProxyChecker) collectResults(workingProxies <-chan WorkingProxy, httpCo
 }
 
 // worker processes proxies from the job channel, testing ALL protocols for each proxy
+// Optimized with early termination: dead proxies fail fast, working proxies get full retry validation
 func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, workingProxies chan<- WorkingProxy, checked, working, additionalAttempts *atomic.Int32) {
 	for proxy := range jobs {
 		select {
@@ -503,30 +505,38 @@ func (c *ProxyChecker) worker(ctx context.Context, jobs <-chan domain.Proxy, wor
 			var amazonValid, akamaiValid, icanhaziPValid bool
 			foundWorking := false
 
-			// Make RetryCount attempts for this protocol
-			for attempt := 0; attempt < c.cfg.RetryCount; attempt++ {
-				if attempt > 0 {
+			// First attempt - always performed
+			stats, ok := c.checkProtocol(ctx, proxy, protocol)
+			if ok && stats != nil {
+				publicIP = stats.publicIP
+				foundWorking = true
+				totalSuccessCount += stats.successCount
+				allLatencies = append(allLatencies, stats.latencies...)
+				amazonValid = stats.amazonValid
+				akamaiValid = stats.akamaiValid
+				icanhaziPValid = stats.icanhaziPValid
+
+				// Proxy works with this protocol - perform additional attempts for statistics
+				for attempt := 1; attempt < c.cfg.RetryCount; attempt++ {
 					time.Sleep(c.cfg.RetryDelay)
 					additionalAttempts.Add(1)
-				}
 
-				stats, ok := c.checkProtocol(ctx, proxy, protocol)
-				if ok && stats != nil {
-					if !foundWorking {
-						publicIP = stats.publicIP
-						foundWorking = true
+					stats, ok := c.checkProtocol(ctx, proxy, protocol)
+					if ok && stats != nil {
+						totalSuccessCount += stats.successCount
+						allLatencies = append(allLatencies, stats.latencies...)
+
+						// Aggregate endpoint flags (OR operation)
+						amazonValid = amazonValid || stats.amazonValid
+						akamaiValid = akamaiValid || stats.akamaiValid
+						icanhaziPValid = icanhaziPValid || stats.icanhaziPValid
 					}
-					totalSuccessCount += stats.successCount
-					allLatencies = append(allLatencies, stats.latencies...)
-
-					// Aggregate endpoint flags (OR operation - true if succeeded at least once)
-					amazonValid = amazonValid || stats.amazonValid
-					akamaiValid = akamaiValid || stats.akamaiValid
-					icanhaziPValid = icanhaziPValid || stats.icanhaziPValid
 				}
 			}
+			// If first attempt failed (ok == false), skip remaining attempts for this protocol
+			// This is the key optimization: dead proxies fail fast
 
-			// Report if this protocol works (at least one endpoint succeeded)
+			// Report if this protocol works
 			if foundWorking && totalSuccessCount > 0 {
 				workingProxies <- WorkingProxy{
 					Proxy:          proxy,
